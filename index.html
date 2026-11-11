@@ -5131,6 +5131,7 @@ function runBotDecision(pid,_retry=0) {
   const verBefore=_botStateVersion;
   try { _runBotDecisionInner(pid); }
   catch(e) { console.error('[Bot error]',pid,e); }
+  finally { _botNoFinish=false; }
   // 若執行後版本沒變（沒廣播）且仍輪到該機器人 → 重排一次（最多2次防死循環）
   if (_botStateVersion===verBefore&&localGame?.state==='PLAY'&&_retry<2) {
     const stillMyTurn=localGame.currentTurn===pid||localGame.pendingDog?.fromId===pid||localGame.pendingDragon?.waitFor===pid;
@@ -5161,7 +5162,7 @@ function _botGetSpecialsPlayed(game) {
 }
 
 function _runBotDecisionInner(pid) {
-  _botCurReason=null;
+  _botCurReason=null; _botNoFinish=false; _botGuardHit=false;
   const game=localGame;
   const p=game.players.find(pp=>pp.id===pid);
   if (!p||!p.isBot) return;
@@ -5294,6 +5295,9 @@ function _runBotDecisionInner(pid) {
 
     if (!cur) {
       // ── 首出：理智選牌策略 ──
+      const ctxL=_botTeamCtx(pid,game);
+      // 隊友有宣告（要讓他第一個出完）或自己要墊底 → 這次領牌不准出完（只剩 1 張時沒辦法）
+      _botNoFinish=((_BOT_R3.H&&!!ctxL.declMate)||(_BOT_R3.J&&shouldDelay))&&hand.length>=2;
 
       // 拖延模式：有狗先出狗（狗會交給要保住分數的隊友）；沒有就出最低單張，讓得分較多的隊友好接、先清手當第5名
       if (shouldDelay) {
@@ -5303,6 +5307,9 @@ function _runBotDecisionInner(pid) {
           const rDog=_botPlay(pid,[dogD.id],null);
           if (!rDog?.error) { _broadcastState(); return; }
         }
+        // 高分隊友剩 1～2 張：直接餵他收尾
+        const feedD=_botFeedLead(hand,pid,game,_botGetPlan(pid,hand).groups,ctxL);
+        if (feedD) { const rF=_botPlay(pid,feedD.map(c=>c.id),null); if (!rF?.error) { _broadcastState(); return; } }
         const lowest = [...hand]
           .filter(c => c.type !== 'dog')
           .sort((a, b) => {
@@ -5311,6 +5318,7 @@ function _runBotDecisionInner(pid) {
           })[0];
         if (lowest) {
           _botWhy('禮讓：出最小的牌，讓高分隊友先出完');
+          if (lowest.type==='dragon') _botWhy('禮讓：手上只剩大牌，先出龍');
           const rD = _botPlay(pid, [lowest.id], lowest.type === 'sparrow' ? _botChooseWish(hand,pid) : null);
           if (!rD?.error) { _broadcastState(); return; }
         }
@@ -5356,6 +5364,7 @@ function _runBotDecisionInner(pid) {
       const wishVal=hasSpInLead?_botChooseWish(hand,pid):null;
       const r=_botPlay(pid,lead.map(c=>c.id),wishVal);
       if (r?.error) {
+        if (_botGuardHit) _botWhy(ctxL.declMate?'不出完：隊友 '+_botName(game,ctxL.declMate.id)+' 有宣告，不能比他先出完，先出一張':'禮讓：我要墊底，不能先出完，先出一張');
         // lead 失敗（可能因許願強制出特定牌）→ 先嘗試含許願牌的組合，再逐張試
         if (wish) {
           const wc=hand.filter(c=>c.type==='normal'&&c.value===wish);
@@ -5382,6 +5391,10 @@ function _runBotDecisionInner(pid) {
       // ── 跟牌：含隊友意識、阻止地主、炸彈時機判斷 ──
       const declared=!!(game.declarations[pid]?.tichu||game.declarations[pid]?.grandTichu);
       const canPass=!wish||!game._canSatisfyWish(pid);
+      // 隊友有宣告（要讓他第一個出完）或自己要墊底 → 能 PASS 的時候，不准出會讓自己出完的牌
+      const ctxF=_botTeamCtx(pid,game);
+      const hMode=_BOT_R3.H&&!!ctxF.declMate;
+      _botNoFinish=(hMode||(_BOT_R3.J&&shouldDelay))&&canPass;
 
       // 拖延模式：原則上 PASS 讓隊友先清手；
       // 但如果是「對手」贏著這墩、而我能用便宜的牌（不動龍鳳、不拆炸彈）壓過，就搶回出牌權，
@@ -5392,7 +5405,8 @@ function _runBotDecisionInner(pid) {
         let grabbed=false;
         if (oppWinD&&helpLeaderId&&(game.hands[helpLeaderId]?.length||0)>0) {
           const rp=_botFindRegularPlay(hand,cur,wish,game,pid);
-          const cheap=rp&&rp.every(c=>c.type==='normal'&&c.value<=13);
+          // 用來搶的牌不能是自己最後的牌（一出就出完，反而變成高分隊友墊底）
+          const cheap=rp&&(rp.length<hand.length||!_BOT_R3.J)&&rp.every(c=>c.type==='normal'&&c.value<=13);
           if (cheap) { _botWhy('禮讓：先搶回出牌權，下一手交給高分隊友'); const rG=_botPlay(pid,rp.map(c=>c.id),null); if (!rG?.error) { _broadcastState(); grabbed=true; } }
         }
         if (grabbed) return;
@@ -5425,7 +5439,7 @@ function _runBotDecisionInner(pid) {
       // 策略①：隊友正在贏著 → PASS
       // 隊友已贏著這輪 = 對手地主也無法贏此墩，不需要再加牌
       // 移除 !mustBlock 條件：即使對手地主快清手，隊友贏著就夠了，不要搶自己人的墩
-      const canClearSoon=hand.length<=4;
+      const canClearSoon=hand.length<=4&&!_botNoFinish;
       // 隊友如果已宣告小/大地主，正贏著這墩就是他要出完手牌的關鍵時刻，
       // 絕對不能被自己「也想清手/也宣告了」等理由搶走出牌權，否則會害隊友宣告失敗
       const teammateDeclared=teammateWinning&&
@@ -5440,30 +5454,76 @@ function _runBotDecisionInner(pid) {
         return;
       }
 
-      // 策略①-b：爛牌出A搶出牌權
-      // 場上是低於A的單張 + 有3張以上「真正孤張」低牌（不在保護組內）→ 出A搶先手
-      // 龍未出場時，A可能被龍壓（不值得冒險）；龍已出 → A是最大單張，出A更安全
-      if (!shouldDelay && !teammateWinning && !mustBlock &&
+      // ── 第三輪：擋快出完的對手（照座位分工）、讓隊友接 ──
+      const curLen=cur?.length||0;
+      const curIsBomb=!!cur&&(cur.type===T.FOUR||cur.type===T.SF);
+      const lastIsOpp0=!!lastPlay&&!_botIsTeammate(pid,lastPlay.playerId,game);
+      // 這一手出來之後，已經輪過（PASS 過）的人：出牌者之後、我之前
+      const actedOnCur=id=>!!lastPlay&&_botBetween(game,lastPlay.playerId,pid).includes(id);
+      const handN=id=>game.hands[id]?.length||0;
+      // 威脅：①對手贏著這墩、只剩 ≤2 張（大家都 PASS 他就領牌出完）②有宣告的對手贏著、剩 ≤3 張
+      //       ③還沒輪到的對手剩下的張數剛好等於這墩張數（剩 1 張遇到單張、有宣告的剩 2 張遇到對子…）→ 這墩就可能出完
+      let threat=null;
+      if (!_BOT_R3.I) {} else if (lastIsOpp0&&handN(lastPlay.playerId)<=2) threat=lastPlay.playerId;
+      else if (ticherSoftBlock) threat=ticher.id;
+      if (_BOT_R3.I&&_BOT_R3.I3&&!threat&&cur&&!curIsBomb) {
+        const tf=game.players.find(p=>game.team(p.id)!==myTeam&&p.id!==lastPlay?.playerId&&handN(p.id)===curLen
+          &&!actedOnCur(p.id)&&(curLen===1||_botDeclared(game,p.id)));
+        if (tf) threat=tf.id;
+      }
+      // 擋人是「他上家」的責任：我後面、他前面還有我方隊友 → 交給隊友頂，我保住自己的牌
+      let blockNow=false, blockMin=false;
+      if (threat) {
+        const deferTo=_botBetween(game,pid,threat).filter(id=>game.team(id)===myTeam);
+        // 交給後面隊友的前提：他手上「大概有」夠大的牌（單張 A／龍／鳳，對子 KK 以上…）；
+        // 只靠一個人擋太冒險，對打測試顯示無條件交棒會讓快出完的對手常常溜走
+        let mateCan=0;
+        if (deferTo.length&&cur) {
+          const unD=_botUnseen(pid,game);
+          const strong={type:cur.type,length:cur.length,power:Math.max(cur.power,cur.type===T.SINGLE?13:12)};
+          let none=1; for (const id of deferTo) none*=1-_botOppCanBeat(unD,handN(id),strong);
+          mateCan=1-none;
+        }
+        if (_BOT_R3.I1&&deferTo.length&&canPass&&!teammateWinning&&mateCan>=_BOT_R3.Imate) {
+          const up=deferTo[deferTo.length-1];
+          _botWhy('不擋：後面的隊友 '+_botName(game,up)+' 在 '+_botName(game,threat)+' 前面出牌，交給他頂，我保住自己的牌');
+          const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
+        }
+        if (!teammateWinning) { blockNow=true; blockMin=hMode; } // 隊友有宣告：以隊友為主，用剛好壓得過的牌
+      }
+      if (!threat&&lastIsOpp0&&canPass&&!curIsBomb&&cur) {
+        // 隊友剩下的張數剛好等於這墩張數、還沒輪到他 → 可能直接接上出完，不墊高門檻（自己有宣告除外）
+        // 而且他「大概接得上」（以沒出現的牌估算他壓得過場上這手的機率），接不上就照常打
+        const unG=_botUnseen(pid,game);
+        const nearMate=_BOT_R3.G&&_BOT_R3.G2f&&!ctxF.meDecl&&ctxF.mates.find(m=>handN(m.id)===curLen&&!actedOnCur(m.id)
+          &&_botOppCanBeat(unG,curLen,{type:cur.type,power:cur.power,length:cur.length})>=_BOT_R3.G2p);
+        if (nearMate) {
+          _botWhy('不壓：隊友 '+_botName(game,nearMate.id)+' 剩 '+curLen+' 張，可能直接接上出完，不墊高門檻');
+          const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
+        }
+        // 有宣告的隊友還沒輪到 → 讓他先，不頂高
+        if (_BOT_R3.G&&_BOT_R3.G1&&hMode&&!actedOnCur(ctxF.declMate.id)) {
+          _botWhy('讓隊友：'+_botName(game,ctxF.declMate.id)+' 有宣告、還沒出這墩，讓他先，不頂高');
+          const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
+        }
+      }
+
+      // 策略①-b：爛牌出A搶出牌權——A 是少數能搶分的大牌，要搶出牌權「同時」搶分才划算：
+      // 這墩要有 10 分以上；手上真正的小孤張（計畫裡的單張，三條／對子不算）夠多才出
+      if (!shouldDelay && !teammateWinning && !mustBlock && !blockNow &&
           cur?.type===T.SINGLE && cur.power<14 && canPass) {
         const norms=hand.filter(c=>c.type==='normal');
-        if (norms.length>=4&&hand.length>=5) {
-          // 先算計劃，只把「未受保護的孤張低牌」算在內
+        const trickPts_b=game.trick.reduce((s,c)=>s+cardScore(c),0);
+        if (norms.length>=4&&hand.length>=5&&(trickPts_b>=10||!_BOT_R3.E)) {
           const plan_b=_botGetPlan(pid,hand);
           const pIds_b=plan_b.protectedIds;
           const freeAces=norms.filter(c=>c.value===14&&!pIds_b.has(c.id));
           if (freeAces.length) {
-            // orphanLow 只計算未受保護的低牌（順子/連對等保護組裡的低牌不算"孤張"）
-            const freeNorms_b=norms.filter(c=>!pIds_b.has(c.id));
-            const orphanLow=freeNorms_b.filter(c=>c.value<=7).length;
-            // 只在手上有 3 張以上真正的孤張低牌時才值得搶先手出A
+            const orphanLow=_BOT_R3.E?plan_b.groups.filter(gr=>gr.type==='single'&&gr.cards[0].type==='normal'&&gr.cards[0].value<=7).length
+              :norms.filter(c=>!pIds_b.has(c.id)&&c.value<=7).length;
             const dragonOut=specials.dragon||hand.some(c=>c.type==='dragon');
-            _botWhy('手上小孤張多，出 A 搶出牌權');
-            if (orphanLow>=3&&dragonOut) {
-              // 龍已出場：A是最大，值得搶
-              const r=_botPlay(pid,[freeAces[0].id],null);
-              if (!r?.error){_broadcastState();return;}
-            } else if (orphanLow>=4&&!dragonOut) {
-              // 龍未出場：門檻提高（需4張孤張低牌才值得冒險）
+            if ((orphanLow>=3&&dragonOut)||(orphanLow>=4&&!dragonOut)) {
+              _botWhy('這墩 '+trickPts_b+' 分：出 A 搶分兼搶出牌權（手上小孤張 '+orphanLow+' 張）');
               const r=_botPlay(pid,[freeAces[0].id],null);
               if (!r?.error){_broadcastState();return;}
             }
@@ -5513,7 +5573,8 @@ function _runBotDecisionInner(pid) {
       // 下一手直接出完清空手牌。這種情況已經算過牌、確定划算，不受其他門檻限制
       // （例如手上 2223：四張2炸下去搶到出牌權，剩一張3單張，下一手就出完了）
       const _bombPreview=_botFindBomb(hand,cur);
-      const _bombFinishes=_botPlayLeadsToFinish(hand,_bombPreview,game);
+      // 「炸完就能出完」：炸完剩下的牌一手就出得完（不是「大概出得完」）
+      const _bombFinishes=!_botNoFinish&&_botPlayLeadsToFinish(hand,_bombPreview,game,true);
       // 炸彈門檻：
       //   早局：積分≥25 才炸；地主剩最後1張時才算絕對必炸（避免開局就炸）
       //   後期：積分≥15；對手剩1張無條件炸；AI威脅加成（積分≥8且對手囤積）
@@ -5532,7 +5593,9 @@ function _runBotDecisionInner(pid) {
       const _topOpp=_activeOpps.reduce((b,p)=>(!b||_ptsOf(p.id)>_ptsOf(b.id))?p:b,null);
       const _blockTopOpp=lastIsOpp&&_topOpp&&lastPlay.playerId===_topOpp.id
         &&_ptsOf(_topOpp.id)>=20&&(game.hands[_topOpp.id]?.length||99)<=6;
-      const worthBomb=declared
+      // 隊友有宣告：炸彈只用來保護他（對手快出完，對手先出完他一樣失敗），不為搶分或自己出完而炸
+      const _bombUrgent=ticherLastCard||(ticherSoftBlock&&!selfPtsAtRisk)||(oppNearDone&&trickPts>=5)||oppLastCard||blockNow;
+      const worthBomb=hMode?_bombUrgent:(declared
         ||ticherLastCard                              // 地主剩最後1張：無論如何都要擋
         ||(ticherSoftBlock&&!selfPtsAtRisk)            // 軟性阻擋：自己分數安全才拚炸彈
         ||_bombFinishes                                // 確定炸完能整手清空 → 值得
@@ -5542,11 +5605,24 @@ function _runBotDecisionInner(pid) {
              ((earlyGame?trickPts>=25:trickPts>=15)&&bombWorthProfit)
            ||(!earlyGame&&_aiThreatBonus&&bombWorthProfit)
            ||(suppressOpp&&trickPts>=8&&bombWorthProfit)))
-        ||(!_canFinishAfter&&_blockTopOpp);            // 自己出不完：只用來壓高分對手
+        ||(!_canFinishAfter&&_blockTopOpp)             // 自己出不完：只用來壓高分對手
+        ||blockNow);
+      // 只是為了搶分才炸（不是擋人、不是出完）
+      const _bombForPtsOnly=worthBomb&&!(_bombUrgent||declared||_bombFinishes||(!_canFinishAfter&&_blockTopOpp));
 
       // 策略②：找普通出牌（不含炸彈）
       let regularPlay=_botFindRegularPlay(hand,cur,wish,game,pid);
-      const iSelfNearDone=hand.length<=4;
+      const iSelfNearDone=hand.length<=4&&!_botNoFinish;
+      let skipWhy=null; // 有牌可壓但決定不壓的原因（給上帝視角看）
+      const _urgent=!canPass||mustBlock||oppNearDone||oppLastCard||blockNow;
+      // F：為了搶分把順子／連對拆散（拆完剩下的也組不成同一種牌）→ 不值得，除非是擋人／非出不可
+      if (_BOT_R3.F&&regularPlay&&regularPlay._broke&&!regularPlay._broke.ok&&['straight','conseq_pairs'].includes(regularPlay._broke.type)) {
+        const finishes=!_botNoFinish&&_botPlayLeadsToFinish(hand,regularPlay,game,true);
+        if (!_urgent&&!finishes&&trickPts<_BOT_R3.Fpts&&regularPlay._broke.rest>=_BOT_R3.Frest) {
+          skipWhy='不跟：要拆 '+_botRangeText(regularPlay._broke.cards)+' '+(_BOT_TN[regularPlay._broke.type]||'')+'，只為 '+trickPts+' 分不值得';
+          regularPlay=null;
+        }
+      }
 
       // 高成本單張把關：用大牌（K/A/鳳凰/龍）單張硬壓，成本很高——
       // 這些大牌是之後搶回出牌權、清掉自己爛牌的本錢。若自己手牌不理想（不健康或還很多）
@@ -5559,10 +5635,36 @@ function _runBotDecisionInner(pid) {
         const blockJustifies=ticherLastCard||(ticherSoftBlock&&!(myHandTroubled&&myBankedPts>=50));
         // 例外：已經算過牌，確定這張大牌打出去搶到出牌權後，剩下的牌一次就出得完
         // （例如龍鳳皆已出場，手上A是絕對大牌，出A之後剩下的正好湊成一組）→ 值得，不受限制
-        const singleFinishes=_botPlayLeadsToFinish(hand,regularPlay,game);
+        const singleFinishes=!_botNoFinish&&_botPlayLeadsToFinish(hand,regularPlay,game);
         const worthBig=declared||blockJustifies||singleFinishes||trickPts>=10
-          ||oppNearDone||oppLastCard||iSelfNearDone||suppressOpp||!canPass;
-        if (!worthBig) regularPlay=null;
+          ||oppNearDone||oppLastCard||iSelfNearDone||suppressOpp||!canPass||blockNow;
+        if (!worthBig) { skipWhy='不用 '+_godCardText(regularPlay[0])+' 壓：大牌留著搶回出牌權，這墩只有 '+trickPts+' 分'; regularPlay=null; }
+      }
+
+      // B：壓牌前先算「會不會送分」——自己打出去的 5／10／K 也算進這墩，壓完被更大的牌搶走，等於送分給對手
+      if (_BOT_R3.B&&regularPlay&&!_urgent&&!declared) {
+        const myPtsB=regularPlay.reduce((a,c)=>a+cardScore(c),0);
+        if (myPtsB>=5) {
+          const qB=_botBeatProb(pid,game,regularPlay);
+          if (qB>=(myPtsB>=10?_BOT_R3.Bq10:_BOT_R3.Bq5)) {
+            const potB=trickPts+myPtsB, orig=regularPlay;
+            // 先找不帶分的牌壓
+            const noPts=hand.filter(c=>cardScore(c)<=0);
+            let alt=noPts.length?_botFindRegularPlay(noPts,cur,wish,game,pid):null;
+            _botGetPlan(pid,hand); // 還原手牌計畫快取
+            if (alt&&alt._broke&&!alt._broke.ok&&['straight','conseq_pairs'].includes(alt._broke.type)) alt=null;
+            if (alt&&alt.length===1&&(alt[0].type==='dragon'||alt[0].type==='phoenix'||(alt[0].type==='normal'&&alt[0].value>=14))&&trickPts<10) alt=null;
+            if (!_BOT_R3.Balt) alt=null;
+            if (alt) { regularPlay=alt; regularPlay._altWhy='改出 '+_botCardsText(alt)+'：出 '+_botCardsText(orig)+' 這墩會變 '+potB+' 分，後面對手約 '+Math.round(qB*100)+'% 壓得過'; }
+            else if (_BOT_R3.Bskip&&potB>=_BOT_R3.BskipPot&&(!_BOT_R3.BskipWeak||!_botLikelyFinish(hand))) { skipWhy='不搶：出 '+_botCardsText(orig)+' 這墩會變 '+potB+' 分，後面對手約 '+Math.round(qB*100)+'% 壓得過，等於送分'; regularPlay=null; }
+          }
+        }
+      }
+
+      // I／G3：輪到我擋 → 用「他最可能接不上」的牌（隊友有宣告時只用剛好壓得過的牌）
+      if (_BOT_R3.I2&&blockNow&&!blockMin&&threat) {
+        const sb=_botStrongBlock(hand,cur,pid,game,threat);
+        if (sb) { regularPlay=sb.cards; regularPlay._altWhy='頂高：'+_botName(game,threat)+' 剩 '+handN(threat)+' 張'+(_botDeclared(game,threat)?'、有宣告':'')+'，我是最後一個能擋的，出 '+_botCardsText(sb.cards)+(sb.p<=0.12?'（他幾乎接不上）':'（手上最大的）'); }
       }
 
       // 便宜壓牌：對手贏著、而我能用「非保護組的閒牌」「原封不動的一整組」
@@ -5590,6 +5692,7 @@ function _runBotDecisionInner(pid) {
 
       // 決定是否值得跟牌（避免有牌就出）
       const shouldPlayRegular=!canPass        // 許願強制出
+        ||blockNow                            // 輪到我擋快出完的對手
         ||declared                            // 自己宣告地主 → 積極
         ||mustBlock                           // 必須阻止對手
         ||trickPts>=5                         // 積分 ≥5 → 值得搶（含5和10）
@@ -5601,7 +5704,7 @@ function _runBotDecisionInner(pid) {
         ||healthySuppress;                    // 手牌健康 → 主動壓制對手的多張組合
 
       if (regularPlay&&shouldPlayRegular) {
-        _botWhy(!canPass?'有指定牌，必須出':declared?'自己有宣告，積極搶':mustBlock?'擋對手宣告':oppLastCard?'對手剩最後 1 張，一定要搶'
+        _botWhy(regularPlay._altWhy?regularPlay._altWhy:blockNow?'擋 '+_botName(game,threat)+'：他剩 '+handN(threat)+' 張，我是最後一個能擋的':!canPass?'有指定牌，必須出':declared?'自己有宣告，積極搶':mustBlock?'擋對手宣告':oppLastCard?'對手剩最後 1 張，一定要搶'
           :oppNearDone?'對手快出完，搶':iSelfNearDone?'自己快出完，出':trickPts>=5?'這墩有 '+trickPts+' 分，搶'
           :suppressOpp?'壓高分對手':cheapBeat?'用散牌便宜壓過，順便清牌':'手牌健康，壓對手的組合');
         const r=_botPlay(pid,regularPlay.map(c=>c.id),null);
@@ -5611,7 +5714,7 @@ function _runBotDecisionInner(pid) {
       // 策略②-龍：單張墩且普通牌壓不過，用龍搶高分墩（≥10分）或終盤
       if (!regularPlay&&cur?.type===T.SINGLE&&!teammateWinning) {
         const dragon=hand.find(c=>c.type==='dragon');
-        if (dragon&&(trickPts>=10||iSelfNearDone||oppLastCard)) {
+        if (dragon&&(!hMode||blockNow)&&(trickPts>=10||iSelfNearDone||oppLastCard||blockNow)) {
           _botWhy(oppLastCard?'出龍：對手剩最後 1 張':iSelfNearDone?'出龍：自己快出完':'出龍：這墩有 '+trickPts+' 分');
           const r=_botPlay(pid,[dragon.id],null);
           if (!r?.error){_broadcastState();return;}
@@ -5619,9 +5722,20 @@ function _runBotDecisionInner(pid) {
       }
 
       // 策略③：炸彈/同花順 — 隊友正在贏著時絕不炸，且須達炸彈門檻才出
-      const bomb=_botFindBomb(hand,cur);
+      let bomb=_botFindBomb(hand,cur);
+      // 只為搶分才炸：選帶分最少的炸彈（4 張 10 本身就 40 分，炸下去這墩變更大、更容易被更大的炸彈搶走）；
+      // 炸彈本身帶 10 分以上、又可能被更大的炸彈壓 → 不炸
+      if (_BOT_R3.B&&bomb&&!teammateWinning&&worthBomb&&_bombForPtsOnly) {
+        const bl=_botBombList(hand,cur);
+        if (bl.length) bomb=bl[0];
+        const bPts=bomb.reduce((a,c)=>a+cardScore(c),0);
+        if (bPts>=10) {
+          const qBomb=_botBeatProb(pid,game,bomb);
+          if (qBomb>=_BOT_R3.Bqb) { skipWhy='不炸：用 '+_botCardsText(bomb)+' 炸，這墩會變 '+(trickPts+bPts)+' 分，約 '+Math.round(qBomb*100)+'% 會被更大的炸彈搶走'; bomb=null; }
+        }
+      }
       if (bomb&&!teammateWinning&&worthBomb) {
-        _botWhy('炸：'+(declared?'自己有宣告':ticherLastCard?'對手宣告剩最後 1 張':ticherSoftBlock?'擋對手宣告':_bombFinishes?'炸完就能出完'
+        _botWhy('炸：'+(blockNow&&threat?'擋 '+_botName(game,threat)+'，他剩 '+handN(threat)+' 張':declared?'自己有宣告':ticherLastCard?'對手宣告剩最後 1 張':ticherSoftBlock?'擋對手宣告':_bombFinishes?'炸完就能出完'
           :oppLastCard?'對手剩最後 1 張':oppNearDone?'對手快出完':(!_canFinishAfter&&_blockTopOpp)?'自己出不完，壓高分對手讓他墊底'
           :'炸完出得完，搶 '+trickPts+' 分'));
         const r=_botPlay(pid,bomb.map(c=>c.id),null);
@@ -5722,7 +5836,8 @@ function _runBotDecisionInner(pid) {
 
       // 其他情況 PASS
       if (canPass) {
-        _botWhy(teammateWinning?'隊友贏著這墩':regularPlay?'壓得過但不值得出（沒分／要留牌）':'壓不過');
+        _botWhy(_botGuardHit?(hMode?'不出完：隊友 '+_botName(game,ctxF.declMate.id)+' 有宣告，不能比他先出完':'禮讓：我要墊底，不能先出完')
+          :teammateWinning?'隊友贏著這墩':skipWhy?skipWhy:regularPlay?'壓得過但不值得出（沒分／要留牌）':'壓不過');
         const r=_botPass(pid);
         if (!r?.error){_broadcastState();return;}
       }
@@ -5775,6 +5890,9 @@ let _aiProfiler=null;  // PlayerProfileTracker 實例（跨局保留）
 // 使「必勝單張」「威脅評估」等依賴記牌的判斷都不準確 ──
 // ── 電腦決策原因（給上帝視角看）：決策點先呼叫 _botWhy('原因')，出牌／PASS 成功時一起記下來 ──
 var _botCurReason=null;
+// 「不准出完」保護：隊友有宣告（要讓他第一個出完）或自己是要墊底的那位時，
+// 這次決策中任何會讓自己出完的出牌都擋下來（只剩 1 張又非出不可的情況不擋）
+var _botNoFinish=false, _botGuardHit=false;
 const _botLastAction=new Map(); // pid → {act, why, t}
 function _botWhy(text){ _botCurReason=text; }
 function _botRecord(pid,act,why){
@@ -5789,9 +5907,14 @@ function _godCardText(c){
   return v+s;
 }
 function _botPlay(pid,cardIds,wish=null,fhPower=null) {
+  const _handBefore=(localGame.hands[pid]||[]).length;
   const _playedCards=(localGame.hands[pid]||[]).filter(c=>(cardIds||[]).includes(c.id));
+  if (_botNoFinish&&_handBefore>1&&_playedCards.length>=_handBefore) { _botGuardHit=true; return {error:'no-finish guard'}; }
   const r=localGame.play(pid,cardIds,wish,fhPower);
-  if (!r?.error) _botRecord(pid,'出 '+_playedCards.map(_godCardText).join(' ')+(wish?'（指定 '+({11:'J',12:'Q',13:'K',14:'A'}[wish]||wish)+'）':''),_botCurReason||'一般出牌');
+  // 原因標籤要跟實際出的牌一致：這手出完了就直接說出完
+  const _fin=_playedCards.length>0&&_playedCards.length>=_handBefore;
+  const _why=_fin?(_handBefore===1?'只剩最後 1 張，直接出完':(_botCurReason?_botCurReason+'（這手出完）':'這手出完')):(_botCurReason||'一般出牌');
+  if (!r?.error) _botRecord(pid,'出 '+_playedCards.map(_godCardText).join(' ')+(wish?'（指定 '+({11:'J',12:'Q',13:'K',14:'A'}[wish]||wish)+'）':''),_why);
   if (!r?.error&&_aiTracker&&_playedCards.length>0) {
     try {
       _aiTracker.recordPlay(pid,_playedCards);
@@ -6076,6 +6199,212 @@ function _botIsUpjiaOfTichu(pid, game) {
 //       確定 = 龍、鳳都已出過（或在自己手上），而且每個還沒出完的對手都只剩 ≤3 張（不可能有炸彈）。
 //       否則先出那手輸牌（例：A2 先出 2），A 留著被壓時搶回出牌權，免得 A 被故意炸掉、2 卡在手上墊底
 //    全部是贏牌 → 從大的出
+// ══ 第三輪：記牌機率、座位順序、隊友／對手宣告 ══
+// 各項策略開關（測試對打時用來比較效果；正式遊戲全部開）
+var _BOT_R3={A:1,B:1,C:1,D:1,E:1,F:1,G:1,H:1,I:1,J:1,
+  I1:1,I2:1,I3:1,Imate:0.85,          // I：後面隊友「很可能」有夠大的牌才交給他擋
+  G1:1,G2f:1,G2l:1,G2p:0.7,           // G：隊友大概接得上才讓
+  Bq10:0.9,Bq5:2,Bqb:0.3,Balt:1,Bskip:1,BskipPot:20,BskipWeak:1, // B：先換不帶分的牌；整手不好出完、這墩 ≥20 分、幾乎一定被壓才不搶
+  Fpts:10,Frest:3};                   // F：這墩 <10 分、拆完會留下 ≥3 張散牌才不拆
+// 只用「公開資訊」推算：自己的手牌＋已經出過的牌（贏牌堆、場上這墩），沒出現的牌平均分在其他人手上
+const _botLnF=(()=>{const a=[0];for(let i=1;i<=130;i++)a[i]=a[i-1]+Math.log(i);return a;})();
+function _botLnC(n,k){ return (k<0||k>n)?-Infinity:_botLnF[n]-_botLnF[k]-_botLnF[n-k]; }
+// N 張沒出現的牌裡有 u 張目標牌，某人手上 h 張 → 他至少拿到 k 張目標牌的機率（超幾何分布）
+function _botAtLeast(u,N,h,k){
+  if (k<=0) return 1;
+  if (N<=0||u<k||h<k) return 0;
+  h=Math.min(h,N); u=Math.min(u,N);
+  const tot=_botLnC(N,h); let p=0;
+  for (let j=k;j<=Math.min(u,h);j++) p+=Math.exp(_botLnC(u,j)+_botLnC(N-u,h-j)-tot);
+  return Math.max(0,Math.min(1,p));
+}
+// 從 pid 的角度：還沒出現的牌（各點數剩幾張、龍鳳出過沒、別人手上共幾張）
+function _botUnseen(pid,game){
+  const cnt={}; for(let v=2;v<=14;v++) cnt[v]=8;
+  let dragon=true, phoenix=true; const ids=new Set();
+  const see=c=>{ if(!c||ids.has(c.id)) return; ids.add(c.id);
+    if (c.type==='normal'){ if(cnt[c.value]>0) cnt[c.value]--; }
+    else if (c.type==='dragon') dragon=false; else if (c.type==='phoenix') phoenix=false; };
+  (game.hands[pid]||[]).forEach(see);
+  Object.values(game.wonCards||{}).forEach(cs=>(cs||[]).forEach(see));
+  (game.trick||[]).forEach(see);
+  (game.pendingDragon?.tc||[]).forEach(see);
+  const N=game.players.reduce((s,p)=>p.id===pid?s:s+(game.hands[p.id]?.length||0),0);
+  return {cnt,dragon,phoenix,N};
+}
+// 手上 h 張的某位對手，壓得過「hd」這手牌的機率（粗估）
+function _botOppCanBeat(un,h,hd){
+  if (!hd||h<=0) return 0;
+  const N=Math.max(un.N,1);
+  const pDr=un.dragon?Math.min(1,h/N):0, pPh=un.phoenix?Math.min(1,h/N):0;
+  const isB=hd.type===T.FOUR||hd.type===T.SF;
+  // 炸彈：一般牌型任何炸彈都壓得過；炸彈要更大的炸彈（六人版同張數同點數也能壓）
+  let noBomb=1;
+  for (let w=2;w<=14;w++) {
+    let need=4;
+    if (hd.type===T.FOUR) need=(w>=hd.power)?hd.length:hd.length+1;
+    else if (hd.type===T.SF) need=hd.length;
+    noBomb*=1-_botAtLeast(un.cnt[w],N,h,need);
+  }
+  const pb=1-noBomb;
+  if (isB) return pb;
+  let pr=0;
+  if (h>=hd.length) {
+    if (hd.type===T.SINGLE) {
+      if (hd.power<15) {
+        let U=0; for (let w=Math.floor(hd.power)+1;w<=14;w++) U+=un.cnt[w];
+        pr=1-(1-_botAtLeast(U,N,h,1))*(1-pDr)*(1-pPh);
+      }
+    } else if (hd.type===T.PAIR||hd.type===T.TRIPLE) {
+      const k=hd.type===T.PAIR?2:3; let none=1;
+      for (let w=hd.power+1;w<=14;w++) {
+        const pk=_botAtLeast(un.cnt[w],N,h,k), pk1=_botAtLeast(un.cnt[w],N,h,k-1);
+        none*=1-Math.min(1,pk+pPh*(pk1-pk));
+      }
+      pr=1-none;
+    } else if (hd.type===T.FH) {
+      let none=1; for (let w=hd.power+1;w<=14;w++) none*=1-_botAtLeast(un.cnt[w],N,h,3);
+      pr=(1-none)*0.85;
+    } else if (hd.type===T.STR||hd.type===T.CPAIRS) {
+      const k=hd.type===T.STR?1:2, L=hd.type===T.STR?hd.length:hd.length/2;
+      let none=1;
+      for (let e=hd.power+1;e<=14;e++) {
+        if (e-L+1<2) continue;
+        let p=1; for (let x=e-L+1;x<=e;x++) p*=_botAtLeast(un.cnt[x],N,h,k);
+        p=p+pPh*(1-p)*0.4;
+        none*=1-p;
+      }
+      pr=1-none;
+    }
+  }
+  return 1-(1-pr)*(1-pb);
+}
+// 我出 cards 之後，還有牌的對手裡「有人壓得過」的機率
+function _botBeatProb(pid,game,cards){
+  const hd=detectHand(cards); if (!hd) return 0;
+  if (hd.type===T.SINGLE&&cards[0]?.type==='phoenix') hd.power=(game.currentHand?.power||1)+0.5;
+  const un=_botUnseen(pid,game), myTeam=game.team(pid);
+  let none=1;
+  for (const p of game.players) {
+    if (game.team(p.id)===myTeam) continue;
+    const h=game.hands[p.id]?.length||0; if (!h) continue;
+    none*=1-_botOppCanBeat(un,h,hd);
+  }
+  return 1-none;
+}
+// 出牌順序：fromPid 之後、toPid 之前（不含兩端）還有牌的玩家
+function _botBetween(game,fromPid,toPid){
+  const out=[], n=game.players.length, s=game.seat(fromPid);
+  for (let i=1;i<n;i++) {
+    const id=game.players[(s+i)%n]?.id;
+    if (!id||id===toPid) break;
+    if ((game.hands[id]?.length||0)>0) out.push(id);
+  }
+  return out;
+}
+function _botDeclared(game,id){ return !!(game.declarations[id]?.tichu||game.declarations[id]?.grandTichu); }
+function _botName(game,id){ return game.players.find(p=>p.id===id)?.name||''; }
+// 隊友／對手的宣告狀況（宣告只有「第一個出完」才成功，所以有人出完後就不用再顧）
+function _botTeamCtx(pid,game){
+  const myTeam=game.team(pid);
+  const act=p=>(game.hands[p.id]?.length||0)>0;
+  const open=(game.finishOrder||[]).length===0;
+  const mates=game.players.filter(p=>p.id!==pid&&game.team(p.id)===myTeam&&act(p));
+  const meDecl=_botDeclared(game,pid);
+  const dm=open&&!meDecl?mates.find(p=>_botDeclared(game,p.id)):null;
+  const declOpp=open?game.players.find(p=>game.team(p.id)!==myTeam&&act(p)&&_botDeclared(game,p.id)):null;
+  return {mates,meDecl,declMate:dm||null,declOpp:declOpp||null};
+}
+// 牌型中文名
+const _BOT_TN={single:'單張',pair:'對子',trips:'三條',fullhouse:'葫蘆',straight:'順子',conseq_pairs:'連對',bomb:'炸彈'};
+function _botCardsText(cs){ return [...cs].sort((a,b)=>(a.value||0)-(b.value||0)).map(_godCardText).join(' '); }
+function _botRangeText(cs){
+  const vs=cs.filter(c=>c.type==='normal').map(c=>c.value).sort((a,b)=>a-b);
+  const t=v=>({11:'J',12:'Q',13:'K',14:'A'}[v]||String(v));
+  return vs.length?(vs[0]===vs[vs.length-1]?t(vs[0]):t(vs[0])+'～'+t(vs[vs.length-1])):'';
+}
+// 隊友剩 1～2 張：拿到出牌權時餵他（剩 2 張 → 全手最小的對子，可從三條／連對／葫蘆拆；剩 1 張 → 最小單張）
+function _botFeedLead(hand,pid,game,planGroups,ctx){
+  if (!_BOT_R3.G||!_BOT_R3.G2l||ctx.meDecl) return null; // 自己有宣告：自己要先出完，不餵
+  const cands=ctx.mates.filter(p=>{const n=game.hands[p.id].length;return n===1||n===2;});
+  if (!cands.length) return null;
+  cands.sort((a,b)=>(_botDeclared(game,b.id)-_botDeclared(game,a.id))||(game.hands[a.id].length-game.hands[b.id].length));
+  const mate=cands[0], n=game.hands[mate.id].length, mateDecl=_botDeclared(game,mate.id);
+  // 有宣告的對手也剩一樣張數 → 餵牌等於也餵他（除非隊友自己有宣告）
+  if (!mateDecl&&ctx.declOpp&&game.hands[ctx.declOpp.id].length===n) return null;
+  // 對手剩一樣張數、而且比隊友先出 → 他會先接走
+  const myTeam=game.team(pid);
+  if (_botBetween(game,pid,mate.id).some(id=>game.team(id)!==myTeam&&game.hands[id].length===n)) return null;
+  const bombIds=new Set(planGroups.filter(g=>g.type==='bomb').flatMap(g=>g.cards.map(c=>c.id)));
+  const strIds=new Set(planGroups.filter(g=>g.type==='straight').flatMap(g=>g.cards.map(c=>c.id)));
+  const norms=hand.filter(c=>c.type==='normal'&&!bombIds.has(c.id));
+  const grOf=c=>planGroups.find(g=>g.cards.some(x=>x.id===c.id));
+  const nm=_botName(game,mate.id);
+  if (n===2) {
+    const byV={}; norms.forEach(c=>(byV[c.value]=byV[c.value]||[]).push(c));
+    let best=null;
+    for (const v of Object.keys(byV).map(Number).sort((a,b)=>a-b)) {
+      const cs=[...byV[v]].sort((a,b)=>(strIds.has(a.id)?1:0)-(strIds.has(b.id)?1:0));
+      if (cs.length<2) continue;
+      const pair=cs.slice(0,2), breaksStr=pair.some(c=>strIds.has(c.id));
+      if (!best||(best.breaksStr&&!breaksStr)) best={pair,breaksStr};
+      if (!breaksStr) break;
+    }
+    if (!best) return null;
+    const g=grOf(best.pair[0]);
+    const src=g&&g.type!=='pair'?'（從'+(_BOT_TN[g.type]||g.type)+' '+_botCardsText(g.cards)+' 拆）':'';
+    _botWhy('領 '+_botCardsText(best.pair)+src+'：隊友 '+nm+' 剩 2 張，餵他對子'+(mateDecl?'（他有宣告）':''));
+    return best.pair;
+  }
+  const singles=norms.filter(c=>!strIds.has(c.id)).sort((a,b)=>a.value-b.value);
+  const pick=singles[0]||norms.sort((a,b)=>a.value-b.value)[0];
+  if (!pick) return null;
+  _botWhy('領 '+_godCardText(pick)+'：隊友 '+nm+' 剩 1 張，出最小單張讓他接'+(mateDecl?'（他有宣告）':''));
+  return [pick];
+}
+// 擋快出完的對手：用「他最可能接不上」的牌（單張：選擋得住的最小牌；對子：選擋得住的最小對子），擋不住就用最大的
+function _botStrongBlock(hand,cur,pid,game,threatId){
+  if (!cur) return null;
+  const un=_botUnseen(pid,game), th=game.hands[threatId]?.length||0;
+  const plan=_botGetPlan(pid,hand);
+  const bombIds=new Set(plan.groups.filter(g=>g.type==='bomb').flatMap(g=>g.cards.map(c=>c.id)));
+  const cands=[];
+  if (cur.type===T.SINGLE) {
+    for (const c of hand) {
+      if (bombIds.has(c.id)||c.type==='dog'||c.type==='sparrow') continue;
+      const pw=c.type==='dragon'?15:c.type==='phoenix'?cur.power+0.5:c.value;
+      if (c.type==='phoenix'&&cur.power>=15) continue;
+      if (pw<=cur.power) continue;
+      cands.push({cards:[c],pw,p:_botOppCanBeat(un,th,{type:T.SINGLE,power:pw,length:1})});
+    }
+  } else if (cur.type===T.PAIR) {
+    const byV={}; hand.filter(c=>c.type==='normal'&&!bombIds.has(c.id)).forEach(c=>(byV[c.value]=byV[c.value]||[]).push(c));
+    for (const v of Object.keys(byV).map(Number)) {
+      if (byV[v].length<2||v<=cur.power) continue;
+      cands.push({cards:byV[v].slice(0,2),pw:v,p:_botOppCanBeat(un,th,{type:T.PAIR,power:v,length:2})});
+    }
+  } else return null;
+  if (!cands.length) return null;
+  cands.sort((a,b)=>a.pw-b.pw);
+  const ok=cands.find(x=>x.p<=0.12);
+  const pick=ok||cands.reduce((b,x)=>x.p<b.p||(x.p===b.p&&x.pw>b.pw)?x:b,cands[0]);
+  return pick;
+}
+// 可以壓過場上牌的炸彈（四張以上同點數、同花順），依「帶的分數少 → 小」排序
+function _botBombList(hand,cur){
+  const g={}; hand.filter(c=>c.type==='normal').forEach(c=>(g[c.value]=g[c.value]||[]).push(c));
+  const out=[];
+  for (const [v,cs] of Object.entries(g)) {
+    if (cs.length<4) continue;
+    const b=cs.slice(0,4);
+    if (canBeat(cur,{type:T.FOUR,power:+v,length:4})) out.push(b);
+  }
+  const sf=_botFindBomb(hand,cur);
+  if (sf&&!out.some(b=>b.length===sf.length&&b.every(c=>sf.some(x=>x.id===c.id)))) out.push(sf);
+  const pts=b=>b.reduce((s,c)=>s+cardScore(c),0);
+  return out.sort((a,b)=>pts(a)-pts(b)||(detectHand(a)?.power||0)-(detectHand(b)?.power||0));
+}
+
 // 粗估「這手牌出不出得完」：把手牌拆成組合，數「需要出牌權才出得掉的輸牌」和「能搶回出牌權的贏牌」，
 // 輸牌最多比贏牌多 1 手才算出得完（最後一手輸牌出掉就算出完，不必贏）
 function _botLikelyFinish(hand) {
@@ -6121,23 +6450,66 @@ function _botLeadCore(hand, pid, game, planGroups) {
   if (!groups.length) return null;
   const isWinner=gr=>(gr.type==='single'||gr.type==='pair')&&gr.cards[0].value===14;
   const winners=groups.filter(isWinner), losers=groups.filter(gr=>!isWinner(gr));
+  const ctx=_botTeamCtx(pid,game);
+  // 長順子要不要切：看情況
+  //   整條出：切下來的牌沒有 A（切了只會多出爛單張），或手牌少（≤10 張）／自己有宣告、而且手上還有龍／鳳／炸彈能搶回出牌權
+  //   切掉：手牌還多、A 又是唯一能搶回出牌權的牌 → 只出低的 5 張，A 留著
+  const hasEntry=hand.some(c=>c.type==='dragon'||c.type==='phoenix')||(planGroups||[]).some(gr=>gr.type==='bomb');
+  let trimNote='';
   const trim=gr=>{
-    if (gr.type==='straight'&&gr.cards.length>5) { const l5=gr.cards.slice(0,5); if (detectHand(l5)) return l5; }
+    trimNote='';
+    if (gr.type==='straight'&&gr.cards.length>5) {
+      const cut=gr.cards.slice(5), cutAce=cut.some(c=>c.value===14);
+      const top=gr.cards[gr.cards.length-1].value===14;
+      if (!_BOT_R3.A) { const l5=gr.cards.slice(0,5); if (detectHand(l5)) return l5; }
+      if (!cutAce||((hand.length<=10||ctx.meDecl)&&hasEntry)) {
+        trimNote='（整條出 '+_botRangeText(gr.cards)+(top?'，接到 A 只有炸彈壓得過':'，不留散牌')+(cutAce&&hasEntry?'；手上還有大牌能搶回出牌權':'')+'）';
+        return gr.cards;
+      }
+      // 只把 A 留下來，其他照樣一起出（不要多切出 Q、K 這類爛單張）
+      const noA=gr.cards.filter(c=>c.value!==14);
+      if (noA.length>=5&&detectHand(noA)) { trimNote='（出 '+_botRangeText(noA)+'，A 留著搶回出牌權）'; return noA; }
+    }
     if (gr.type==='conseq_pairs'&&gr.cards.length>4) { const l4=gr.cards.slice(0,4); if (detectHand(l4)) return l4; }
     return gr.cards;
   };
   const valid=cs=>cs&&detectHand(cs)?cs:null;
   // 手上還有狗、龍、鳳這些牌時，「最後一手」不是真的最後一手，輸牌只剩 1 手的打法不適用
   const extraLeft=hand.some(c=>c.type==='dog'||c.type==='dragon'||c.type==='phoenix');
-  const TYPE_NAME={single:'單張',pair:'對子',trips:'三條',fullhouse:'葫蘆',straight:'順子',conseq_pairs:'連對'};
+  const TYPE_NAME=_BOT_TN;
   const lowVal=gr=>Math.min(...gr.cards.map(c=>c.value));
+  // 隊友有宣告：出小單張／低對子讓他好接，把出牌權交給他；自己不搶著出完
+  if (_BOT_R3.G&&_BOT_R3.G1&&ctx.declMate&&losers.length) {
+    const easy=losers.filter(gr=>gr.type==='single'||gr.type==='pair')
+      .sort((a,b)=>lowVal(a)-lowVal(b)||(a.type==='single'?-1:1));
+    const pick=easy[0]||[...losers].sort((a,b)=>lowVal(a)-lowVal(b))[0];
+    const cs=valid(trim(pick))||valid(pick.cards);
+    if (cs) { _botWhy('領牌：隊友 '+_botName(game,ctx.declMate.id)+' 有宣告，出小的'+(TYPE_NAME[pick.type]||'')+'讓他接，把出牌權交給他'); return cs; }
+  }
   if (losers.length>=2||(losers.length===1&&extraLeft)) {
+    // 自己有宣告：不隨機挑牌型 →
+    //   ① 先出「只能靠領牌才出得掉」的組牌（順子／連對／葫蘆／三條），挑最不容易被壓的
+    //   ② 其次低的對子　③ 單張留著跟別人的牌
+    if (_BOT_R3.C&&ctx.meDecl) {
+      const multi=losers.filter(gr=>['straight','conseq_pairs','fullhouse','trips'].includes(gr.type));
+      if (multi.length) {
+        const scored=multi.map(gr=>{const cs=trim(gr);const note=trimNote;return {gr,cs,note,q:_botBeatProb(pid,game,cs)};})
+          .sort((a,b)=>a.q-b.q||b.cs.length-a.cs.length);
+        const m=scored[0];
+        if (valid(m.cs)) { _botWhy('領牌（有宣告）：先出只能靠領牌出掉的'+(TYPE_NAME[m.gr.type]||'')+m.note+'，被壓機率約 '+Math.round(m.q*100)+'%'); return m.cs; }
+      }
+      const pairs=losers.filter(gr=>gr.type==='pair').sort((a,b)=>lowVal(a)-lowVal(b));
+      if (pairs.length&&losers.some(gr=>gr.type==='single')) {
+        _botWhy('領牌（有宣告）：先出低的對子，單張留著跟別人的牌'); return valid(pairs[0].cards);
+      }
+    }
     // 隨機挑牌型，同牌型從最小的出
     const types=[...new Set(losers.map(gr=>gr.type))];
     const t=types[Math.floor(Math.random()*types.length)];
     const pick=losers.filter(gr=>gr.type===t).sort((a,b)=>lowVal(a)-lowVal(b))[0];
-    _botWhy('領牌：隨機挑牌型「'+(TYPE_NAME[t]||t)+'」，同牌型先出最小的');
-    return valid(trim(pick))||valid(losers[0].cards);
+    const cs=valid(trim(pick));
+    _botWhy('領牌：隨機挑牌型「'+(TYPE_NAME[t]||t)+'」，同牌型先出最小的'+trimNote);
+    return cs||valid(losers[0].cards);
   }
   // 贏牌是否「確定不會被壓」
   const sp2=_botGetSpecialsPlayed(game);
@@ -6208,9 +6580,9 @@ function _botChooseLead(hand, pid, game) {
 
   // ── 危險單張：對手剩1張，禁止出單張 ──
   if (danger) {
-    _botWhy('對手剩 1 張：不出小單張，擋他出完');
     const imUpjia=pid&&game?_botIsUpjiaOfTichu(pid,game):true;
     const sortHigh=(a,b)=>{const v=c=>c.type==='dragon'?200:c.type==='phoenix'?150:c.value;return v(b)-v(a);};
+    const tn=gr=>_BOT_TN[gr.type]||gr.type;
 
     if (!imUpjia) {
       // 我不是上家：優先讓隊友先出完，讓對手小地主失敗
@@ -6222,24 +6594,30 @@ function _botChooseLead(hand, pid, game) {
       if (teammateHas2) {
         // 找最小的對子出，讓隊友有機會出對子完成（小地主跟不上對子）
         const smallPair=nonBombGroups.find(gr=>gr.type==='pair'&&detectHand(gr.cards));
-        if (smallPair) return smallPair.cards;
+        if (smallPair) { _botWhy('對手剩 1 張：出小對子（他跟不上），隊友剩 2 張可以接'); return smallPair.cards; }
       }
       // 其他非單張組合：讓對手跟不上
       const nonSingle=nonBombGroups.find(gr=>gr.type!=='single'&&detectHand(gr.cards));
-      if (nonSingle) return nonSingle.cards;
+      if (nonSingle) { _botWhy('對手剩 1 張：出'+tn(nonSingle)+'，他只剩 1 張跟不上'); return nonSingle.cards; }
       // 只剩單張：出低牌讓領先手，等隊友（上家）用大牌擋
       const lowCard=hand.filter(c=>c.type!=='dog'&&c.type!=='dragon'&&c.type!=='phoenix')
         .sort((a,b)=>a.value-b.value)[0];
-      if (lowCard) return [lowCard];
+      if (lowCard) { _botWhy('對手剩 1 張：只剩單張可出，出小的，交給他的上家（隊友）用大牌擋'); return [lowCard]; }
       const topCard=hand.filter(c=>c.type!=='dog').sort(sortHigh)[0];
-      if (topCard) return [topCard];
+      if (topCard) { _botWhy('對手剩 1 張：只剩大牌，出最大的'); return [topCard]; }
     } else {
       // 我是上家：必須自己阻擋小地主；先嘗試非單張，否則出最大牌
       const nonSingle=nonBombGroups.find(gr=>gr.type!=='single'&&detectHand(gr.cards));
-      if (nonSingle) return nonSingle.cards;
+      if (nonSingle) { _botWhy('對手剩 1 張、我是他上家：出'+tn(nonSingle)+'，他跟不上'); return nonSingle.cards; }
       const topCard=hand.filter(c=>c.type!=='dog').sort(sortHigh)[0];
-      if (topCard) return [topCard];
+      if (topCard) { _botWhy('對手剩 1 張、我是他上家：只剩單張，出最大的擋他'); return [topCard]; }
     }
+  }
+
+  // ── 隊友剩 1～2 張：餵他收尾（對子可以從三條／連對／葫蘆拆）──
+  if (game&&pid) {
+    const feed=_botFeedLead(hand,pid,game,planGroups,_botTeamCtx(pid,game));
+    if (feed) return feed;
   }
 
   // 龍：規則上，領出龍贏了這墩之後，這一墩（含龍本身+25分）一定要送給對手，不能自己留！
@@ -6248,15 +6626,16 @@ function _botChooseLead(hand, pid, game) {
   // 對手不知道我手上還有沒有龍，出A搶上手權時會有顧慮（怕被龍反壓），
   // 這種「潛在威脅」的價值，往往比主動打出去對手一次還珍貴。
   // 真的需要擋對手時，留著龍等對手出牌時再用（跟牌）反而更有效率，不用預先主動送分
+  // 龍是「對手出單張時壓下來、不讓對手上手」的牌。自己已經有出牌權時把龍領出去，出牌權本來就在手上，
+  // 只會白送對手 25 分、又丟掉最好的搶回手段（有沒有宣告都一樣）。
+  // 唯一例外：收尾——出完龍，剩下的牌一手就能出完（或只剩龍）
   if (dragon&&game&&pid) {
-    const hasDeclared=game?.declarations?.[pid]?.tichu||game?.declarations?.[pid]?.grandTichu;
-    if (hasDeclared) {
-      // 已宣告：成功與否是100~200分的巨大波動，遠比25分重要，
-      // 需要龍來確保搶到/保住主導權才有機會真的出完拿下宣告，不用等「確定整手出完」才敢用
-      if (hand.length<=8) { _botWhy('出龍：自己有宣告，搶出牌權'); return [dragon]; }
-    } else {
-      const worthIt=_botPlayLeadsToFinish(hand,[dragon],game,true); // 沒宣告：贏了要送對手25分，不是穩出完不冒險
-      if (worthIt) { _botWhy('出龍：出了就能出完'); return [dragon]; }
+    const ctxD=_botTeamCtx(pid,game);
+    const onlyDragon=hand.filter(c=>c.type!=='dog').length===1;
+    if (!_BOT_R3.D&&_botDeclared(game,pid)&&hand.length<=8) { _botWhy('出龍：自己有宣告，搶出牌權'); return [dragon]; }
+    if (onlyDragon||(!ctxD.declMate&&_botPlayLeadsToFinish(hand,[dragon],game,true))) {
+      _botWhy(onlyDragon?'只剩龍，出龍':'出龍收尾：龍贏了之後，剩下的一手直接出完');
+      return [dragon];
     }
   }
 
@@ -6487,7 +6866,17 @@ function _botFindRegularPlay(hand,curHand,wish,game,pid) {
         const gPh=hasPh||gr.cards.some(c=>c.type==='phoenix');
         const gSp=hasSp||gr.cards.some(c=>c.type==='sparrow');
         const result=_botMatchType(gNorms,gPh,gSp,curHand,hand);
-        if(result) return result;
+        if(result) {
+          // 標記「拆了哪一組」：拆完剩下的部分如果自己還是同一種牌型（或全部用完），不算破壞
+          const used=gr.cards.filter(gc=>result.some(c=>c.id===gc.id));
+          if (used.length&&used.length<gr.cards.length) {
+            const rest=gr.cards.filter(gc=>!result.some(c=>c.id===gc.id));
+            const rh=detectHand(rest);
+            const same=rh&&((gr.type==='straight'&&rh.type===T.STR)||(gr.type==='conseq_pairs'&&rh.type===T.CPAIRS));
+            result._broke={type:gr.type,cards:gr.cards,ok:!!same,rest:rest.length};
+          }
+          return result;
+        }
       }
       return null; // 連炸彈以外的所有組合都無法匹配，讓呼叫端決定是否 PASS
     }
