@@ -5323,11 +5323,13 @@ function _runBotDecisionInner(pid) {
       const declaredTm=tms.find(tid=>game.declarations[tid]?.tichu||game.declarations[tid]?.grandTichu);
       const leaderTm=(()=>{const l=_botTeammatePointLeader(pid,game);return l&&tms.includes(l)?l:null;})();
       const stuckTm=_botStuckTeammate(pid,game,tms);
-      const target=declaredTm||leaderTm||stuckTm||tms.reduce((best,tid)=>{
+      const ctxDog=_botTeamCtx(pid,game);
+      const fastTm=(_BOT_R3.Y&&_BOT_R3.Ydog&&ctxDog.declOpp)?tms.reduce((b,t)=>(game.hands[t]?.length||99)<(game.hands[b]?.length||99)?t:b,tms[0]):null;
+      const target=declaredTm||fastTm||leaderTm||stuckTm||tms.reduce((best,tid)=>{
         return (game.hands[tid]?.length||0)>(game.hands[best]?.length||0)?tid:best;
       },tms[0]);
       _botRecord(pid,'狗給 '+(game.players.find(p=>p.id===target)?.name||''),
-        target===declaredTm?'他有宣告':target===leaderTm?'他分數高，要保住第五名':target===stuckTm?'他連續 PASS 很久':'他手牌比較多');
+        target===declaredTm?'他有宣告':target===fastTm?'對手有宣告，給手牌最少的隊友衝第一':target===leaderTm?'他分數高，要保住第五名':target===stuckTm?'他連續 PASS 很久':'他手牌比較多');
       _hostHandleMsg(fakeConn,{type:'GIVE_DOG',pid,toId:target});
       return;
     }
@@ -5521,7 +5523,7 @@ function _runBotDecisionInner(pid) {
       const teammateIsLeader=teammateWinning&&helpLeaderId&&lastPlay.playerId===helpLeaderId;
       // O：適度壓隊友——用自己 10 以下的小牌、只比隊友大一點（最多大 3），順便把小牌清掉，免得最後小牌都卡在手上；
       //    不用 K／A／龍／鳳／炸彈壓隊友；隊友剩 ≤2 張、有宣告、是要保住分數的高分隊友時不壓；自己要墊底時不壓
-      if (_BOT_R3.O&&teammateWinning&&canPass&&!declared&&!teammateDeclared&&!teammateIsLeader&&!shouldDelay&&!hMode
+      if (_BOT_R3.O&&teammateWinning&&canPass&&!declared&&!teammateDeclared&&!teammateIsLeader&&!shouldDelay&&!hMode&&!(_BOT_R3.Y&&_BOT_R3.Yo&&ctxF.declOpp&&ctxF.mates.length&&lastPlay.playerId===[...ctxF.mates].sort((a,b)=>game.hands[a.id].length-game.hands[b.id].length)[0].id)
           &&(game.hands[lastPlay.playerId]?.length||0)>2&&cur&&(cur.type===T.SINGLE||cur.type===T.PAIR||cur.type===T.TRIPLE)) {
         const ob=_botCheapestBeat(hand,cur,pid,0,1);
         if (ob&&!ob.broke&&ob.cards.every(c=>c.type==='normal'&&c.value<=10)&&Math.max(...ob.cards.map(c=>c.value))-cur.power<=3) {
@@ -5556,6 +5558,8 @@ function _runBotDecisionInner(pid) {
       }
       // 擋人是「他上家」的責任：我後面、他前面還有我方隊友 → 交給隊友頂，我保住自己的牌
       let blockNow=false, blockMin=false;
+      const threatDecl=!!threat&&_botDeclared(game,threat)&&(game.finishOrder||[]).length===0;
+      const threatAll=!!threat&&_BOT_R3.Y&&_BOT_R3.Yall&&threatDecl&&handN(threat)<=3; // Y：有宣告的對手剩 ≤3 張 → 全力擋
       if (threat) {
         const deferTo=_botBetween(game,pid,threat).filter(id=>game.team(id)===myTeam);
         // 交給後面隊友的前提：他手上「大概有」夠大的牌（單張 A／龍／鳳，對子 KK 以上…）；
@@ -5567,7 +5571,7 @@ function _runBotDecisionInner(pid) {
           let none=1; for (const id of deferTo) none*=1-_botOppCanBeat(unD,handN(id),strong);
           mateCan=1-none;
         }
-        if (_BOT_R3.I1&&deferTo.length&&canPass&&!teammateWinning&&mateCan>=_BOT_R3.Imate) {
+        if (_BOT_R3.I1&&!threatAll&&deferTo.length&&canPass&&!teammateWinning&&mateCan>=_BOT_R3.Imate) {
           const up=deferTo[deferTo.length-1];
           _botWhy('不擋：後面的隊友 '+_botName(game,up)+' 在 '+_botName(game,threat)+' 前面出牌，交給他頂，我保住自己的牌');
           const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
@@ -5588,6 +5592,18 @@ function _runBotDecisionInner(pid) {
         if (_BOT_R3.G&&_BOT_R3.G1&&hMode&&!actedOnCur(ctxF.declMate.id)) {
           _botWhy('讓隊友：'+_botName(game,ctxF.declMate.id)+' 有宣告、還沒出這墩，讓他先，不頂高');
           const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
+        }
+      }
+
+      // Y：有宣告的對手贏著、剩 4～6 張 → 壓他（可以用 A／龍／鳳，可以拆對子），不讓他拿出牌權
+      if (_BOT_R3.Y&&_BOT_R3.Ymid&&ctxF.declOpp&&lastPlay&&lastPlay.playerId===ctxF.declOpp.id&&canPass&&!teammateWinning&&cur&&!curIsBomb&&!blockNow) {
+        const dh=handN(ctxF.declOpp.id);
+        if (dh>=4&&dh<=6) {
+          const yb=_botCheapestBeat(hand,cur,pid,3,0,{allowBreak:true});
+          if (yb) {
+            _botWhy('擋宣告：'+_botName(game,ctxF.declOpp.id)+' 有宣告、剩 '+dh+' 張，不讓他拿出牌權，用 '+_botCardsText(yb.cards)+' 壓');
+            const r=_botPlay(pid,yb.cards.map(c=>c.id),null); if (!r?.error){_broadcastState();return;}
+          }
         }
       }
 
@@ -5773,7 +5789,16 @@ function _runBotDecisionInner(pid) {
 
       // I／G3：輪到我擋 → 用「他最可能接不上」的牌（隊友有宣告時只用剛好壓得過的牌）
       if (_BOT_R3.I2&&blockNow&&!blockMin&&threat) {
-        const sb=_botStrongBlock(hand,cur,pid,game,threat);
+        let sb=_botStrongBlock(hand,cur,pid,game,threat,{allowBad:threatAll});
+        // X：沒宣告的對手——要用大牌／拆牌擋，得確定擋完有後手；擋不住就不浪費（便宜的牌照擋）
+        if (_BOT_R3.X&&_BOT_R3.Xpass&&!threatDecl&&canPass&&(cur.type===T.SINGLE||cur.type===T.PAIR)) {
+          const cheap=sb&&sb.tier<=1&&!sb.broke;
+          const after=sb?hand.filter(c=>!sb.cards.some(x=>x.id===c.id)):hand;
+          if (!sb||(!cheap&&!_botFollowUpOk(pid,game,after,threat))) {
+            _botWhy('不擋：'+_botName(game,threat)+' 剩 '+handN(threat)+' 張，'+(sb?'用 '+_botCardsText(sb.cards)+' 擋了，我也沒有後手讓他接不上':'手上沒有不拆組合又擋得住的牌')+'，不浪費大牌');
+            const r=_botPass(pid); if (!r?.error){_broadcastState();return;}
+          }
+        }
         if (sb) { regularPlay=sb.cards; regularPlay._altWhy='頂高：'+_botName(game,threat)+' 剩 '+handN(threat)+' 張'+(_botDeclared(game,threat)?'、有宣告':'')+'，我是最後一個能擋的，出 '+_botCardsText(sb.cards)+(sb.p<=0.12?'（他幾乎接不上）':'（手上最大的）'); }
       }
 
@@ -5881,6 +5906,12 @@ function _runBotDecisionInner(pid) {
           const qBomb=_botBeatProb(pid,game,bomb);
           if (qBomb>=_BOT_R3.Bqb) { skipWhy='不炸：用 '+_botCardsText(bomb)+' 炸，這墩會變 '+(trickPts+bPts)+' 分，約 '+Math.round(qBomb*100)+'% 會被更大的炸彈搶走'; bomb=null; }
         }
+      }
+      if (_BOT_R3.X&&_BOT_R3.Xbomb&&bomb&&!teammateWinning&&worthBomb&&!declared&&!_bombFinishes&&!(ticherLastCard||ticherSoftBlock)&&!threatDecl
+          &&(oppNearDone||oppLastCard||blockNow)&&lastIsOpp) {
+        const tId=threat||lastPlay.playerId;
+        const after=hand.filter(c=>!bomb.some(b=>b.id===c.id));
+        if (!_botFollowUpOk(pid,game,after,tId)) { skipWhy='不炸：'+_botName(game,tId)+' 剩 '+handN(tId)+' 張，炸完我只剩 '+_botCardsText(after)+'，擋不住他'; bomb=null; }
       }
       if (bomb&&!teammateWinning&&worthBomb) {
         _botWhy('炸：'+(blockNow&&threat?'擋 '+_botName(game,threat)+'，他剩 '+handN(threat)+' 張':declared?'自己有宣告':ticherLastCard?'對手宣告剩最後 1 張':ticherSoftBlock?'擋對手宣告':_bombFinishes?'炸完就能出完'
@@ -6396,7 +6427,7 @@ var _BOT_R3={A:1,B:1,C:1,D:1,E:1,F:1,G:1,H:1,I:1,J:1,
   G1:1,G2f:1,G2l:1,G2p:0.7,           // G：隊友大概接得上才讓
   Bq10:0.9,Bq5:2,Bqb:0.3,Balt:1,Bskip:1,BskipPot:20,BskipWeak:1, // B：先換不帶分的牌；整手不好出完、這墩 ≥20 分、幾乎一定被壓才不搶
   Fpts:10,Frest:3,
-  K:1,L:1,M:1,N:1,O:1,P:1,R:1,S:1,T:1,U:1,V:1,W:1,Lpts:2,Mpts:2,Lcap:1,Mfin:0,M5cap:0,M10cap:1};                   // K 上家把關、L 便宜壓牌、M 搶分看代價、N 隨時炸                   // F：這墩 <10 分、拆完會留下 ≥3 張散牌才不拆
+  K:1,L:1,M:1,N:1,O:1,P:1,R:1,S:1,T:1,U:1,V:1,W:1,X:1,Xplan:1,Xpass:0,Xbomb:1,Y:1,Ylead:1,Ymid:1,Yall:1,Ydog:1,Yo:0,Lpts:2,Mpts:2,Lcap:1,Mfin:0,M5cap:0,M10cap:1};                   // K 上家把關、L 便宜壓牌、M 搶分看代價、N 隨時炸                   // F：這墩 <10 分、拆完會留下 ≥3 張散牌才不拆
 // 只用「公開資訊」推算：自己的手牌＋已經出過的牌（贏牌堆、場上這墩），沒出現的牌平均分在其他人手上
 const _botLnF=(()=>{const a=[0];for(let i=1;i<=130;i++)a[i]=a[i-1]+Math.log(i);return a;})();
 function _botLnC(n,k){ return (k<0||k>n)?-Infinity:_botLnF[n]-_botLnF[k]-_botLnF[n-k]; }
@@ -6554,7 +6585,26 @@ function _botFeedLead(hand,pid,game,planGroups,ctx){
   return [pick];
 }
 // 擋快出完的對手：用「他最可能接不上」的牌（單張：選擋得住的最小牌；對子：選擋得住的最小對子），擋不住就用最大的
-function _botStrongBlock(hand,cur,pid,game,threatId){
+// X：擋下來之後，我（或在他之前出牌的隊友）有沒有辦法讓他接不上
+//   中間有隊友、而且隊友大概有大牌 → 交給隊友；否則我自己要有「他張數不夠跟」的組合，或他幾乎壓不過的牌
+function _botFollowUpOk(pid,game,handAfter,threatId){
+  if (!handAfter.length) return true;
+  const h=game.hands[threatId]?.length||0; if (!h) return true;
+  const myTeam=game.team(pid), un=_botUnseen(pid,game);
+  const mates=_botBetween(game,pid,threatId).filter(id=>game.team(id)===myTeam);
+  if (mates.length) {
+    let none=1; for (const id of mates) none*=1-_botOppCanBeat(un,game.hands[id]?.length||0,{type:T.SINGLE,power:13,length:1});
+    if (1-none>=0.5) return true;
+  }
+  if (handAfter.some(c=>c.type==='dragon')) return true;
+  for (const gr of _botBuildPlan(handAfter).groups) {
+    const hd=detectHand(gr.cards); if (!hd) continue;
+    if (gr.cards.length>h) return true;
+    if (_botOppCanBeat(un,h,hd)<=0.15) return true;
+  }
+  return false;
+}
+function _botStrongBlock(hand,cur,pid,game,threatId,opts){
   if (!cur) return null;
   const un=_botUnseen(pid,game), th=game.hands[threatId]?.length||0;
   const plan=_botGetPlan(pid,hand);
@@ -6575,6 +6625,11 @@ function _botStrongBlock(hand,cur,pid,game,threatId){
       cands.push({cards:byV[v].slice(0,2),pw:v,p:_botOppCanBeat(un,th,{type:T.PAIR,power:v,length:2})});
     }
   } else return null;
+  if (_BOT_R3.X&&_BOT_R3.Xplan) {
+    // 照拆牌規則挑：不拆順子／連對／炸彈，拆對子三條要拆完打得出去（全力擋有宣告的對手時才放寬）
+    for (const x of cands) { const c=_botCostOf(hand,pid,x.cards); x.bad=c.bad; x.broke=c.broke; x.tier=c.tier; }
+    if (!(opts&&opts.allowBad)) { const keep=cands.filter(x=>!x.bad); cands.length=0; cands.push(...keep); }
+  }
   if (!cands.length) return null;
   cands.sort((a,b)=>a.pw-b.pw);
   const ok=cands.find(x=>x.p<=0.12);
@@ -6915,6 +6970,26 @@ function _botChooseLead(hand, pid, game) {
     })
     .sort((a,b)=>a.score-b.score)
     .map(x=>x.gr);
+
+  // ── Y：有宣告的對手剩 ≤6 張 → 出他「張數不夠跟」的牌型；同時挑手牌最少的隊友接得上的 ──
+  if (_BOT_R3.Y&&_BOT_R3.Ylead&&game&&pid) {
+    const ctxY=_botTeamCtx(pid,game);
+    if (ctxY.declOpp&&!ctxY.meDecl) {
+      const dh=game.hands[ctxY.declOpp.id]?.length||0;
+      if (dh>0&&dh<=6) {
+        const fast=[...ctxY.mates].sort((a,b)=>game.hands[a.id].length-game.hands[b.id].length)[0];
+        const fm=fast?game.hands[fast.id].length:0;
+        const lv=gr=>Math.min(...gr.cards.filter(c=>c.type==='normal').map(c=>c.value));
+        const opts=nonBombGroups.filter(gr=>gr.cards.length>dh&&detectHand(gr.cards)&&gr.cards.length<hand.length+1);
+        if (opts.length) {
+          opts.sort((a,b)=>((a.cards.length<=fm?0:1)-(b.cards.length<=fm?0:1))||(lv(a)-lv(b)));
+          const pk=opts[0];
+          _botWhy('擋宣告：'+_botName(game,ctxY.declOpp.id)+' 剩 '+dh+' 張，出 '+pk.cards.length+' 張的'+(_BOT_TN[pk.type]||'')+' 他跟不上'+(fast&&pk.cards.length<=fm?'，隊友 '+_botName(game,fast.id)+'（剩 '+fm+' 張）可能接得上':''));
+          return pk.cards;
+        }
+      }
+    }
+  }
 
   // ── 危險單張：對手剩1張，禁止出單張 ──
   if (danger) {
